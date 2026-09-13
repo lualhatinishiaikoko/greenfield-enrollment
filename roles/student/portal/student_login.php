@@ -1,15 +1,21 @@
 <?php
-// A distinct cookie name keeps the teacher portal's session independent
+// A distinct cookie name keeps the student portal's session independent
 // from the admin/staff one — otherwise logging into one role in a
 // second browser tab would silently overwrite the other tab's session
-// (same reasoning as roles/student/portal/student_login.php's STUDENT_SESSID).
-session_name('TEACHER_SESSID');
+// (they'd share the same default PHP session cookie).
+session_name('STUDENT_SESSID');
 session_start();
-require_once __DIR__ . '/../../bootstrap.php';
+require_once __DIR__ . '/../../../bootstrap.php';
 
 // Already logged in — don't show the login form again, send them onward.
 if (isset($_SESSION['logged_in']) && $_SESSION['logged_in'] === true) {
-    header("Location: " . (!empty($_SESSION['must_change_password']) ? "teacher_change_password" : "teacher_dashboard"));
+    if (($_SESSION['role'] ?? '') === 'admin') {
+        header("Location: " . APP_URL . "/roles/admin/dashboard");
+    } elseif (($_SESSION['role'] ?? '') === 'student') {
+        header("Location: student_dashboard");
+    } else {
+        header("Location: " . APP_URL . "/roles/staff/dashboard");
+    }
     exit();
 }
 
@@ -28,17 +34,16 @@ if (isset($_POST['login_btn'])) {
     } else {
 
     $stmt = $conn->prepare("
-        SELECT u.user_id, t.teacher_id, u.username, u.password_hash, u.must_change_password
-        FROM users u
-        JOIN teachers t ON t.user_id = u.user_id
-        WHERE u.username = ?
-          AND u.role = 'teacher'
-          AND u.is_active = 1
-          AND t.is_active = 1
+        SELECT user_student_id, student_id, username, password_hash
+        FROM users_student
+        WHERE username = ?
+          AND is_active = 1
         LIMIT 1
     ");
+
     $stmt->bind_param("s", $username);
     $stmt->execute();
+
     $result = $stmt->get_result();
 
     if ($result->num_rows === 1) {
@@ -49,15 +54,23 @@ if (isset($_POST['login_btn'])) {
 
             login_throttle_record($conn, $username, $login_ip, true);
             session_regenerate_id(true);
-            $_SESSION['logged_in']             = true;
-            $_SESSION['user_id']               = $row['user_id'];
-            $_SESSION['teacher_id']            = $row['teacher_id'];
-            $_SESSION['username']              = $row['username'];
-            $_SESSION['role']                  = 'teacher';
-            $_SESSION['must_change_password']  = (bool) $row['must_change_password'];
-            $_SESSION['sg_tab_token']          = $_POST['tab_token'] ?? '';
+            $_SESSION['logged_in']       = true;
+            $_SESSION['user_student_id'] = $row['user_student_id'];
+            $_SESSION['username']        = $row['username'];
+            $_SESSION['role']            = 'student';
+            $_SESSION['student_id']      = $row['student_id'];
+            $_SESSION['sg_tab_token']    = $_POST['tab_token'] ?? '';
 
-            header("Location: " . ($_SESSION['must_change_password'] ? "teacher_change_password" : "teacher_dashboard"));
+            $logStmt = $conn->prepare("
+                INSERT INTO student_activity_log (student_id, activity_type, ip_address)
+                VALUES (?, 'login', ?)
+            ");
+            $ip = $_SERVER['REMOTE_ADDR'] ?? null;
+            $logStmt->bind_param("is", $row['student_id'], $ip);
+            $logStmt->execute();
+            $logStmt->close();
+
+            header("Location: student_dashboard");
             exit();
 
         } else {
@@ -83,11 +96,11 @@ $conn->close();
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Teacher Login — Greenfield Senior High School</title>
+<title>Sign In — Student Portal</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,450;9..144,560;9..144,650&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="<?= APP_URL ?>/assets/css/css_teacher.css?v=<?= filemtime(__DIR__ . '/../../assets/css/css_teacher.css') ?>">
+<link rel="stylesheet" href="<?= APP_URL ?>/assets/css/css_student.css?v=<?= filemtime(__DIR__ . '/../../../assets/css/css_student.css') ?>">
 </head>
 <body class="auth-page auth-landing-page">
 
@@ -101,8 +114,8 @@ $conn->close();
 <div class="landing<?= $modal_open ? ' hidden' : '' ?>" id="landing">
   <div class="landing-mark"><img src="<?= APP_URL ?>/assets/images/log_ui.png" alt=""></div>
   <p class="landing-eyebrow">Greenfield Senior High School</p>
-  <h1 class="landing-title">Teacher Portal</h1>
-  <p class="landing-sub">Sign in to view your classes, schedule, and announcements.</p>
+  <h1 class="landing-title">Student Portal</h1>
+  <p class="landing-sub">Sign in to view your enrollment, schedule, and payments.</p>
   <button type="button" class="btn-open-login" id="openLoginBtn">Log In</button>
 </div>
 
@@ -117,10 +130,10 @@ $conn->close();
   </div>
 
   <p class="school-name">GREENFIELD SENIOR HIGH SCHOOL</p>
-  <h1>Teacher Portal</h1>
-  <p class="lede">Sign in to view your classes, schedule, and announcements.</p>
+  <h1>Student Portal</h1>
+  <p class="lede">Sign in to view your enrollment, schedule, and payments.</p>
 
-  <form method="POST" action="teacher_login">
+  <form method="POST" action="student_login">
     <?php if (!empty($error_message)): ?>
       <div class="auth-error"><?= htmlspecialchars($error_message) ?></div>
     <?php endif; ?>
@@ -168,15 +181,13 @@ $conn->close();
         <input type="checkbox" id="rememberMe" name="remember_me">
         <span>Remember me</span>
       </label>
-      <a class="forgot-link" href="teacher_forgotpassword">Forgot password?</a>
+      <a class="forgot-link" href="student_forgotpassword">Forgot password?</a>
     </div>
 
     <input type="hidden" name="tab_token" id="tabToken" value="">
 
     <button type="submit" name="login_btn" class="login-btn">Log In</button>
   </form>
-
-  <p class="forgot">Staff or Admin? <a href="../login">Log in here</a></p>
 </div>
 </div>
 
@@ -200,9 +211,6 @@ $conn->close();
   (function () {
     var capsNote = document.getElementById('capslockNote');
     if (!capsNote) return;
-    // visibility (not display) — the note always keeps its slot in the
-    // label row, so toggling it can never change the row's height or
-    // nudge anything else in the card.
     function setCaps(isCaps) { capsNote.style.visibility = isCaps ? 'visible' : 'hidden'; }
     function checkCaps(e) {
       setCaps(typeof e.getModifierState === 'function' && e.getModifierState('CapsLock'));
@@ -236,7 +244,7 @@ $conn->close();
 
   (function () {
     var token = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + '-' + Math.random().toString(36).slice(2));
-    sessionStorage.setItem('sg_tab_token', token);
+    sessionStorage.setItem('sg_tab_token_student', token);
     document.getElementById('tabToken').value = token;
   })();
 </script>

@@ -1,13 +1,8 @@
 <?php
-session_name('TEACHER_SESSID');
+// Distinct cookie name keeps the student session independent from admin/staff (see student_login.php).
+session_name('STUDENT_SESSID');
 session_start();
-require_once __DIR__ . '/../../bootstrap.php';
-
-if (isset($_SESSION['logged_in']) && $_SESSION['logged_in'] === true && ($_SESSION['role'] ?? '') !== 'teacher') {
-    header("Location: teacher_login");
-    exit();
-}
-guard_password_change('teacher_change_password', 'teacher');
+require_once __DIR__ . '/../../../bootstrap.php';
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -15,23 +10,23 @@ guard_password_change('teacher_change_password', 'teacher');
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>My Schedule — SHS Enrollment</title>
-    <link rel="stylesheet" href="<?= APP_URL ?>/assets/css/css_teacher.css?v=<?= filemtime(__DIR__ . '/../../assets/css/css_teacher.css') ?>">
+    <link rel="stylesheet" href="<?= APP_URL ?>/assets/css/css_student.css?v=<?= filemtime(__DIR__ . '/../../../assets/css/css_student.css') ?>">
 </head>
-<body class="teacher-layout">
-<?php if (!isset($_SESSION['logged_in']) || $_SESSION['logged_in'] !== true): ?>
-  <p>You are not logged in. Please <a href="teacher_login">log in</a> to access this page.</p>
+<body class="student-layout">
+<?php if (!isset($_SESSION['logged_in']) || $_SESSION['logged_in'] !== true || ($_SESSION['role'] ?? '') !== 'student'): ?>
+  <p>You are not logged in. Please <a href="student_login">log in</a> to access this page.</p>
 
 <?php else: ?>
   <?php
-    include_once BASE_PATH . '/shared/includes/teacher_sidebar.php';
+    include_once BASE_PATH . '/shared/includes/student_sidebar.php';
 
-    $teacher_id = (int) $_SESSION['teacher_id'];
+    $student_id = (int) $_SESSION['student_id'];
 
-    // Distinct school years this teacher has an assignment for, most
-    // recent first — drives the school-year selector in the toolbar.
+    // Distinct school years this student has an enrollment record for, most recent first —
+    // drives the school-year selector in the toolbar below.
     $sy_list = [];
-    $sy_stmt = mysqli_prepare($conn, "SELECT DISTINCT school_year FROM teacher_assignments WHERE teacher_id = ? AND is_active = 1 ORDER BY school_year DESC");
-    mysqli_stmt_bind_param($sy_stmt, "i", $teacher_id);
+    $sy_stmt = mysqli_prepare($conn, "SELECT DISTINCT school_year FROM enrollments WHERE student_id = ? ORDER BY school_year DESC");
+    mysqli_stmt_bind_param($sy_stmt, "i", $student_id);
     mysqli_stmt_execute($sy_stmt);
     $sy_res = mysqli_stmt_get_result($sy_stmt);
     while ($row = mysqli_fetch_assoc($sy_res)) { $sy_list[] = $row['school_year']; }
@@ -43,66 +38,69 @@ guard_password_change('teacher_change_password', 'teacher');
     }
 
     $selected_sem = (string) ($_GET['sem'] ?? '1');
-    if (!in_array($selected_sem, ['1', '2'], true)) { $selected_sem = '1'; }
+    if (!in_array($selected_sem, ['1', '2'], true)) {
+        $selected_sem = '1';
+    }
 
-    // Semester 2 only shows a class once it genuinely has an enrolled
-    // Semester 2 student — not merely because a Sem2 schedule slot was set
-    // up — so a teacher never sees/prepares for a class that might still
-    // change before anyone is actually in it. Accountabilities are
-    // re-checked live here too (inlined, mirroring
-    // has_outstanding_accountabilities()'s rule) rather than trusting
-    // semester2_status alone, since a student can be workflow-approved yet
-    // still have an outstanding document.
-    $sem2_enrolled_clause = $selected_sem === '2'
-        ? "AND EXISTS (
-               SELECT 1 FROM enrollments e
-               JOIN students st2 ON st2.student_id = e.student_id
-               LEFT JOIN student_education se2 ON se2.student_id = st2.student_id
-               WHERE e.section_id = ta.section_id AND e.school_year = ta.school_year
-                 AND e.status = 'enrolled' AND e.semester2_status = 'approved'
-                 AND NOT EXISTS (
-                     SELECT 1 FROM enrollment_requirements er
-                     JOIN requirement_types rt ON rt.requirement_type_id = er.requirement_type_id
-                     WHERE er.enrollment_id = e.enrollment_id AND rt.is_active = 1
-                       AND er.status != 'submitted'
-                       AND (rt.applicable_to != 'public_jhs_only' OR se2.is_public = 1)
-                 )
-           )"
-        : '';
-
-    $sch_stmt = mysqli_prepare($conn, "
-        SELECT sec.section_name, sec.grade_level, st.strand_code AS strand,
-               sub.subject_name, ta.semester,
-               ss.day, ss.start_time, ss.end_time,
-               COALESCE(ss.room, sec.room) AS room
-        FROM teacher_assignments ta
-        JOIN subjects sub ON sub.subject_id = ta.subject_id
-        JOIN sections sec ON sec.section_id = ta.section_id
-        JOIN strands st ON st.strand_id = sec.strand
-        LEFT JOIN section_subjects ss
-               ON ss.section_id = ta.section_id
-              AND ss.subject_id = ta.subject_id
-              AND ss.teacher_id = ta.teacher_id
-              AND ss.semester = ta.semester
-        WHERE ta.teacher_id = ? AND ta.is_active = 1 AND ta.school_year = ? AND ta.semester = ?
-        $sem2_enrolled_clause
-        ORDER BY FIELD(ss.day, 'Mon','Tue','Wed','Thu','Fri'), ss.start_time
+    $enr_stmt = mysqli_prepare($conn, "
+        SELECT e.enrollment_id, e.section_id, st.strand_code AS strand, e.admission_grade_level AS grade_level, e.school_year,
+               e.status, e.semester2_status, se.is_public AS jhs_is_public
+        FROM enrollments e
+        JOIN strands st ON st.strand_id = e.admission_strand
+        JOIN students s ON s.student_id = e.student_id
+        LEFT JOIN student_education se ON se.student_id = s.student_id
+        WHERE e.student_id = ? AND e.school_year = ?
+        ORDER BY e.enrollment_date DESC, e.enrollment_id DESC
+        LIMIT 1
     ");
-    mysqli_stmt_bind_param($sch_stmt, "isi", $teacher_id, $selected_sy, $selected_sem);
-    mysqli_stmt_execute($sch_stmt);
-    $rows = mysqli_fetch_all(mysqli_stmt_get_result($sch_stmt), MYSQLI_ASSOC);
-    mysqli_stmt_close($sch_stmt);
+    mysqli_stmt_bind_param($enr_stmt, "is", $student_id, $selected_sy);
+    mysqli_stmt_execute($enr_stmt);
+    $enrollment = mysqli_fetch_assoc(mysqli_stmt_get_result($enr_stmt));
+    mysqli_stmt_close($enr_stmt);
 
-    $scheduled   = array_values(array_filter($rows, fn($r) => $r['day'] && $r['start_time'] && $r['end_time']));
-    $unscheduled = array_values(array_filter($rows, fn($r) => !$r['day'] || !$r['start_time'] || !$r['end_time']));
+    // Semester 2 only actually exists once the registrar's wizard pass is
+    // both finalized AND paid (status flips back to 'enrolled' only after
+    // Treasury payment), AND accountabilities are still clear right now —
+    // re-checked live rather than trusted from approval time, so a document
+    // that later lapses (or was approved under an earlier, looser rule)
+    // correctly withholds Semester 2 access again.
+    $sem2_not_yet_enrolled = $selected_sem === '2' && !(
+        $enrollment && $enrollment['status'] === 'enrolled' && $enrollment['semester2_status'] === 'approved'
+        && !has_outstanding_accountabilities($conn, (int) $enrollment['enrollment_id'], (int) $enrollment['jhs_is_public'])
+    );
 
-    // No "class type" column exists on section_subjects, so each subject is
-    // bucketed into one of the three display categories deterministically
-    // (by name) purely for consistent, repeatable colour-coding of the
-    // grid — carries no curricular meaning. Same approach as
-    // roles/student/portal/student_schedule.php.
+    $section_name  = null;
+    $schedule_rows = [];
+
+    if ($enrollment && $enrollment['section_id']) {
+        $sec_stmt = mysqli_prepare($conn, "SELECT section_name FROM sections WHERE section_id = ?");
+        mysqli_stmt_bind_param($sec_stmt, "i", $enrollment['section_id']);
+        mysqli_stmt_execute($sec_stmt);
+        mysqli_stmt_bind_result($sec_stmt, $section_name);
+        mysqli_stmt_fetch($sec_stmt);
+        mysqli_stmt_close($sec_stmt);
+    }
+
+    if ($enrollment && $enrollment['section_id'] && !$sem2_not_yet_enrolled) {
+        $sched_stmt = mysqli_prepare($conn, "
+            SELECT sub.subject_name, ss.day, ss.start_time, ss.end_time, ss.room, CONCAT(t.given_name, ' ', t.family_name) AS teacher_name
+            FROM section_subjects ss
+            JOIN subjects sub ON sub.subject_id = ss.subject_id
+            LEFT JOIN teachers t ON t.teacher_id = ss.teacher_id
+            WHERE ss.section_id = ? AND ss.semester = ?
+            ORDER BY FIELD(ss.day, 'Mon','Tue','Wed','Thu','Fri'), ss.start_time
+        ");
+        mysqli_stmt_bind_param($sched_stmt, "ii", $enrollment['section_id'], $selected_sem);
+        mysqli_stmt_execute($sched_stmt);
+        $schedule_rows = mysqli_fetch_all(mysqli_stmt_get_result($sched_stmt), MYSQLI_ASSOC);
+        mysqli_stmt_close($sched_stmt);
+    }
+
+    // No "class type" column exists on section_subjects, so each subject is bucketed
+    // into one of the three display categories deterministically (by name) purely for
+    // consistent, repeatable colour-coding of the grid — it carries no curricular meaning.
     $sch_types = ['lecture', 'discussion', 'practice'];
-    foreach ($scheduled as &$sr) {
+    foreach ($schedule_rows as &$sr) {
         $sr['type'] = $sch_types[crc32($sr['subject_name']) % 3];
     }
     unset($sr);
@@ -111,47 +109,49 @@ guard_password_change('teacher_change_password', 'teacher');
     $ico_clock    = '<svg fill="none" viewBox="0 0 24 24" stroke="#fff" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" d="M12 7v5l3.2 1.9"/></svg>';
     $ico_print    = '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.7"><path stroke-linecap="round" stroke-linejoin="round" d="M6 9V4h12v5"/><rect x="4" y="9" width="16" height="8" rx="1.5"/><path stroke-linejoin="round" d="M6 14h12v6H6z"/></svg>';
   ?>
-  <div class="teacher-main">
-    <div class="teacher-topbar">
-      <div class="teacher-topbar-left">
-        <div class="teacher-topbar-title">
+  <div class="student-main">
+    <div class="student-topbar">
+      <div class="student-topbar-left">
+        <div class="student-topbar-title">
           My Schedule
-          <span class="teacher-topbar-subtitle">Days, times, and rooms for your subjects</span>
+          <span class="student-topbar-subtitle">Subjects &amp; weekly class schedule</span>
         </div>
       </div>
-      <?php include BASE_PATH . '/shared/includes/teacher_topbar_right.php'; ?>
+      <?php include BASE_PATH . '/shared/includes/student_topbar_right.php'; ?>
     </div>
 
-    <div class="teacher-content">
+    <div class="student-content">
 
-      <?php if (empty($rows)): ?>
-        <div class="notice notice-info">No class assignments found yet.</div>
+      <?php if (!$enrollment): ?>
+        <div class="notice notice-info">No enrollment record found yet.</div>
+      <?php elseif (!$enrollment['section_id']): ?>
+        <div class="notice notice-info">You haven't been assigned to a section yet — check back once enrollment is finalized.</div>
       <?php else: ?>
 
         <div class="sch-page-head">
           <div>
             <h1 class="sch-page-title">My Schedule</h1>
-            <p class="sch-page-sub">S.Y. <?= htmlspecialchars($selected_sy) ?> — <?= $selected_sem === '2' ? '2nd' : '1st' ?> Semester</p>
+            <p class="sch-page-sub"><?= htmlspecialchars('Grade ' . $enrollment['grade_level'] . ' — ' . $enrollment['strand'] . ' — ' . ($section_name ?? '') . ' — S.Y. ' . $enrollment['school_year']) ?></p>
           </div>
           <div class="sch-toolbar">
             <div class="sch-field-select">
-              <select id="schSySelect" onchange="location.href='teacher_schedule?sy='+encodeURIComponent(this.value)+'&sem=<?= urlencode($selected_sem) ?>'" <?= count($sy_list) <= 1 ? 'disabled' : '' ?>>
+              <select id="schSySelect" onchange="location.href='student_schedule?sy='+encodeURIComponent(this.value)+'&sem=<?= urlencode($selected_sem) ?>'" <?= count($sy_list) <= 1 ? 'disabled' : '' ?>>
                 <?php foreach ($sy_list as $sy): ?>
                   <option value="<?= htmlspecialchars($sy) ?>" <?= $sy === $selected_sy ? 'selected' : '' ?>>S.Y. <?= htmlspecialchars($sy) ?></option>
                 <?php endforeach; ?>
               </select>
             </div>
             <div class="sch-field-select">
-              <select id="schSemSelect" onchange="location.href='teacher_schedule?sy=<?= urlencode($selected_sy) ?>&sem='+encodeURIComponent(this.value)">
+              <select id="schSemSelect" onchange="location.href='student_schedule?sy=<?= urlencode($selected_sy) ?>&sem='+encodeURIComponent(this.value)">
                 <option value="1" <?= $selected_sem === '1' ? 'selected' : '' ?>>1st Semester</option>
                 <option value="2" <?= $selected_sem === '2' ? 'selected' : '' ?>>2nd Semester</option>
               </select>
             </div>
-            <button class="sch-btn-print" id="schPrintBtn" type="button"><?= $ico_print ?> Print / Export</button>
+            <button class="sch-btn-print" id="schPrintBtn"><?= $ico_print ?> Print / Export</button>
           </div>
         </div>
 
-        <?php if (!empty($scheduled)): ?>
+        <?php if (!empty($schedule_rows)): ?>
         <div class="sch-next-card" id="schNextCard">
           <div class="sch-next-icon"><?= $ico_clock ?></div>
           <div>
@@ -169,17 +169,20 @@ guard_password_change('teacher_change_password', 'teacher');
         </div>
         <?php endif; ?>
 
-        <div class="teacher-panel-block">
-          <div class="teacher-panel-header">
-            <div class="teacher-panel-header-left">
-              <span class="teacher-panel-icon"><?= $ico_calendar ?></span>
+        <div class="student-panel-block">
+          <div class="student-panel-header">
+            <div class="student-panel-header-left">
+              <span class="student-panel-icon"><?= $ico_calendar ?></span>
               <div>
-                <div class="teacher-panel-title">Weekly Class Schedule</div>
+                <div class="student-panel-title">Weekly Class Schedule</div>
+                <div class="student-panel-sub"><?= htmlspecialchars(($section_name ?? '') . ' — ' . ($selected_sem === '2' ? '2nd' : '1st') . ' Semester') ?></div>
               </div>
             </div>
           </div>
-          <?php if (empty($scheduled)): ?>
-            <p class="empty-state">No schedule has been set for your subjects yet.</p>
+          <?php if ($sem2_not_yet_enrolled): ?>
+            <p class="empty-state">You're not yet enrolled in Semester 2 for this school year.</p>
+          <?php elseif (empty($schedule_rows)): ?>
+            <p class="empty-state">No schedule available for the <?= $selected_sem === '2' ? '2nd' : '1st' ?> Semester yet.</p>
           <?php else: ?>
             <div class="sch-table-wrap">
               <table class="sch-table">
@@ -205,38 +208,12 @@ guard_password_change('teacher_change_password', 'teacher');
           <?php endif; ?>
         </div>
 
-        <?php if (!empty($unscheduled)): ?>
-          <div class="teacher-panel-block" style="margin-top:1rem;">
-            <div class="teacher-panel-header">
-              <div class="teacher-panel-header-left">
-                <div class="teacher-panel-title">Not Yet Scheduled</div>
-              </div>
-            </div>
-            <p class="field-hint" style="margin-bottom:.6rem;">These subjects don't have a day/time set yet — check with the Scheduler office.</p>
-            <table class="data-table">
-              <thead><tr><th>Subject</th><th>Section</th></tr></thead>
-              <tbody>
-                <?php foreach ($unscheduled as $r): ?>
-                  <tr>
-                    <td><?= htmlspecialchars($r['subject_name']) ?></td>
-                    <td class="td-meta">
-                      <?= htmlspecialchars($r['section_name']) ?>
-                      — G<?= htmlspecialchars($r['grade_level']) ?> <?= htmlspecialchars($r['strand']) ?>
-                      · Sem <?= (int)$r['semester'] ?>
-                    </td>
-                  </tr>
-                <?php endforeach; ?>
-              </tbody>
-            </table>
-          </div>
-        <?php endif; ?>
-
       <?php endif; ?>
 
     </div>
   </div>
 
-  <?php if (!empty($scheduled)): ?>
+  <?php if (!empty($schedule_rows)): ?>
   <script>
     const SCH_SCHEDULE = <?= json_encode(array_map(function ($r) {
         return [
@@ -244,11 +221,11 @@ guard_password_change('teacher_change_password', 'teacher');
             'start'   => substr($r['start_time'], 0, 5),
             'end'     => substr($r['end_time'], 0, 5),
             'subject' => $r['subject_name'],
-            'section' => $r['section_name'] . ' — G' . $r['grade_level'] . ' ' . $r['strand'] . ' · Sem ' . $r['semester'],
+            'teacher' => $r['teacher_name'] ?: '—',
             'room'    => $r['room'],
             'type'    => $r['type'],
         ];
-    }, $scheduled)) ?>;
+    }, $schedule_rows)) ?>;
 
     const SCH_DAYS = ["Mon","Tue","Wed","Thu","Fri"];
 
@@ -264,13 +241,17 @@ guard_password_change('teacher_change_password', 'teacher');
     }
     function schFmtRange(start, end) { return schFmtTime(start) + ' – ' + schFmtTime(end); }
 
+    // mark today's column header
     const schDayMapNum = {1:"Mon",2:"Tue",3:"Wed",4:"Thu",5:"Fri"};
     const schTodayCode = schDayMapNum[new Date().getDay()];
     document.querySelectorAll('.sch-table thead th[data-day]').forEach(th => {
       if (th.dataset.day === schTodayCode) th.classList.add('today');
     });
 
+    // ---- build weekly grid rows from the distinct start times actually in use ----
     const schSlots = Array.from(new Set(SCH_SCHEDULE.map(s => s.start))).sort();
+
+    // occupancy matrix: rows = schSlots, cols = SCH_DAYS
     const schMatrix = schSlots.map(() => SCH_DAYS.map(() => undefined));
 
     SCH_SCHEDULE.forEach(item => {
@@ -278,6 +259,7 @@ guard_password_change('teacher_change_password', 'teacher');
       const rowStart = schSlots.indexOf(item.start);
       if (colIndex === -1 || rowStart === -1) return;
 
+      // span forward while the next slot boundary starts before this class ends
       let rowSpan = 1;
       for (let r = rowStart + 1; r < schSlots.length && schMinutes(schSlots[r]) < schMinutes(item.end); r++) {
         rowSpan++;
@@ -317,7 +299,7 @@ guard_password_change('teacher_change_password', 'teacher');
           html += `<div class="c-meta"></div>`;
           block.innerHTML = html;
           block.querySelector('.c-subject').textContent = item.subject;
-          block.querySelector('.c-meta').textContent = item.section;
+          block.querySelector('.c-meta').textContent = item.teacher;
           if (item.room) {
             const roomEl = document.createElement('span');
             roomEl.className = 'sch-room-override';
@@ -335,6 +317,7 @@ guard_password_change('teacher_change_password', 'teacher');
       schTbody.appendChild(tr);
     });
 
+    // ---- live "next / current class" banner ----
     function schUpdateNextClass() {
       const now = new Date();
       const dowMap = {1:"Mon",2:"Tue",3:"Wed",4:"Thu",5:"Fri"};
